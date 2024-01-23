@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
-import librosa
 import logging
 import json
 import random
+import re
 import tarfile
 from subprocess import PIPE, Popen
 from urllib.parse import urlparse
@@ -24,14 +23,18 @@ from urllib.parse import urlparse
 import torch
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
-from wenet.text.base_tokenizer import BaseTokenizer
 
 torchaudio.utils.sox_utils.set_buffer_size(16500)
+import io
+import numpy as np
+from scipy import signal
+from scipy.io import wavfile
 
 AUDIO_FORMAT_SETS = set(['flac', 'mp3', 'm4a', 'ogg', 'opus', 'wav', 'wma'])
 
+# debug = 1
+debug = 0
 
 def url_opener(data):
     """ Give url or local file, return file descriptor
@@ -133,6 +136,8 @@ def parse_raw(data):
         key = obj['key']
         wav_file = obj['wav']
         txt = obj['txt']
+        if "duration" in obj and obj["duration"] < 1:
+            continue
         try:
             if 'start' in obj:
                 assert 'end' in obj
@@ -146,25 +151,13 @@ def parse_raw(data):
                     frame_offset=start_frame)
             else:
                 waveform, sample_rate = torchaudio.load(wav_file)
-            example = copy.deepcopy(obj)  # copy and keep all the fields
-            example['wav'] = waveform  # overwrite wav
-            example['sample_rate'] = sample_rate
+            example = dict(key=key,
+                           txt=txt,
+                           wav=waveform,
+                           sample_rate=sample_rate)
             yield example
         except Exception as ex:
             logging.warning('Failed to read {}'.format(wav_file))
-
-
-def parse_speaker(data, speaker_table_path):
-    speaker_dict = {}
-    with open(speaker_table_path, 'r', encoding='utf8') as fin:
-        for line in fin:
-            arr = line.strip().split()
-            speaker_dict[arr[0]] = int(arr[1])
-    for sample in data:
-        assert 'speaker' in sample
-        speaker = sample['speaker']
-        sample['speaker'] = speaker_dict.get(speaker, 0)
-        yield sample
 
 
 def filter(data,
@@ -215,6 +208,176 @@ def filter(data,
                 continue
         yield sample
 
+def remix(data, resample_rate=16000):
+    """on-the-fly 方式 合并通道 及 采样率转换"""
+    for sample in data:
+        assert 'sample_rate' in sample
+        assert 'wav' in sample
+        sample_rate = sample['sample_rate']
+        waveform = sample['wav']
+        if waveform.size(0) !=1 or sample_rate != resample_rate:
+            wav, _ = torchaudio.sox_effects.apply_effects_tensor(
+                waveform, sample_rate, 
+                [['remix','-'], ['rate',str(resample_rate)]])
+            sample['wav'] = wav
+            sample['sample_rate'] = resample_rate
+
+        if debug:
+            print("-> in remix: ")
+            print("example: ",sample, sample['wav'].shape)
+            print("时长: ",sample['wav'].shape[1]/sample['sample_rate'])
+
+        yield sample
+
+def get_random_chunk(data, chunk_len):
+    """ Get random chunk
+
+        Args:
+            data: torch.Tensor (random len)
+            chunk_len: chunk length
+
+        Returns:
+            torch.Tensor (exactly chunk_len)
+    """
+    data_len = len(data)
+    data_shape = data.shape
+    # random chunk
+    if data_len >= chunk_len:
+        chunk_start = random.randint(0, data_len - chunk_len)
+        data = data[chunk_start:chunk_start + chunk_len]
+        # re-clone the data to avoid memory leakage
+        if type(data) == torch.Tensor:
+            data = data.clone()
+        else:  # np.array
+            data = data.copy()
+    else:
+        # padding
+        repeat_factor = chunk_len // data_len + 1
+        repeat_shape = repeat_factor if len(data_shape) == 1 else (repeat_factor, 1)
+        if type(data) == torch.Tensor:
+            data = data.repeat(repeat_shape)
+        else:  # np.array
+            data = np.tile(data, repeat_shape)
+        data = data[:chunk_len]
+
+    return data
+
+def add_reverb_noise(data,
+                     reverb_source,
+                     noise_source,
+                     resample_rate=16000,
+                     aug_prob=0.6):
+    """ Add reverb & noise aug
+
+        Args:
+            data: Iterable[{key, wav, label, sample_rate}]
+            reverb_source: reverb LMDB data source
+            noise_source: noise LMDB data source
+            resample_rate: resample rate for reverb/noise data
+            aug_prob: aug probability
+
+        Returns:
+            Iterable[{key, wav, label, sample_rate}]
+    """
+    for sample in data:
+        if debug:
+            print("-> see processor.add_reverb_noise")
+            print("sample: ", sample, sample['wav'].shape)
+            print("时长: ",sample['wav'].shape[1]/sample['sample_rate'])
+        # torchaudio.backend.sox_io_backend.save('before_addnoise.wav', sample['wav'], sample['sample_rate'], format = "wav", encoding = "PCM_S", bits_per_sample = 16)
+        # exit(0)
+        assert 'wav' in sample
+        assert 'key' in sample
+        if aug_prob > random.random():  # 一半的音频需要处理
+            # aug_type = random.randint(1, 2)
+            # if aug_type == 1:
+            aug = random.random()
+            if aug <=0.3:    # 这一半的音频中，混响3成，加噪7成
+                audio = sample['wav'].numpy()[0]
+                audio_len = audio.shape[0]
+
+                _, rir_data = reverb_source.random_one()
+                rir_sr, rir_audio = wavfile.read(io.BytesIO(rir_data))
+                rir_audio = rir_audio.astype(np.float32)
+                if rir_sr != resample_rate:
+                    rir_audio = signal.resample( rir_audio, int(len(rir_audio) / rir_sr * resample_rate))
+                rir_audio = rir_audio / np.sqrt(np.sum(rir_audio**2))
+                out_audio = signal.convolve(audio, rir_audio, mode='full')[:audio_len]
+                if debug:
+                    print("reverberation :", _, tmp_rir_audio, tmp_rir_audio.shape)
+                    print("时长: ",tmp_rir_audio.shape[1]/resample_rate)
+                # torchaudio.backend.sox_io_backend.save('reverber.wav', tmp_rir_audio, resample_rate, format = "wav", encoding = "PCM_S", bits_per_sample = 16)
+            else:
+                # add additive noise
+                audio = sample['wav'].numpy()[0]
+                audio_len = audio.shape[0]
+                audio_db = 10 * np.log10(np.mean(audio**2) + 1e-4)
+
+                key, noise_data = noise_source.random_one()
+                if key.startswith('noise'):
+                    snr_range = [0, 15]
+                elif key.startswith('speech'):
+                    snr_range = [10, 30]
+                elif key.startswith('music'):
+                    snr_range = [5, 15]
+                else:
+                    snr_range = [0, 15]
+                noise_sr, noise_audio = wavfile.read(io.BytesIO(noise_data))
+                noise_audio = noise_audio.astype(np.float32) / (1 << 15)
+                if noise_sr != resample_rate:
+                    # Since the noise audio could be very long, it must be
+                    # chunked first before resampled (to save time)
+                    noise_audio = get_random_chunk(
+                        noise_audio,
+                        int(audio_len / resample_rate * noise_sr))
+                    noise_audio = signal.resample(noise_audio, audio_len)
+                else:
+                    noise_audio = get_random_chunk(noise_audio, audio_len)
+
+                if len(noise_audio.shape) == 1: # mono
+                    if debug:
+                        tmp_noise =  torch.from_numpy(noise_audio)
+                        # mono : [21440] \ [1, 21440]
+                        tmp_noise = tmp_noise.unsqueeze(0)
+                        print("noise1 :", key, tmp_noise, tmp_noise.shape)
+                        print("时长: ",tmp_noise.shape[1]/resample_rate)
+                        # torchaudio.backend.sox_io_backend.save('noise.wav', tmp_noise, resample_rate, format = "wav", encoding = "PCM_S", bits_per_sample = 16)
+
+                else : # multi
+                    # multi channels: [21440, 8] \ [1, 21440, 8]
+                    noise_waveform = torch.from_numpy(noise_audio)
+                    noise_waveform = torch.transpose(noise_waveform,0,1)
+                    if debug:
+                        print("noise2 :", noise_waveform, noise_waveform.shape)
+                        print("时长: ",noise_waveform.shape[1]/resample_rate)
+                        # torchaudio.backend.sox_io_backend.save('noise_multi_channel.wav', noise_waveform, resample_rate, format = "wav", encoding = "PCM_S", bits_per_sample = 16)
+                    if noise_waveform.size(0) !=1 :
+                        noise_waveform, _ = torchaudio.sox_effects.apply_effects_tensor(
+                            noise_waveform, resample_rate, 
+                            [['remix','-'], ['rate',str(resample_rate)]])
+                    if debug:
+                        print("noise3 :", noise_waveform, noise_waveform.shape)
+                        print("时长: ",noise_waveform.shape[1]/resample_rate)
+                        # torchaudio.backend.sox_io_backend.save('noise_merge_channel.wav', noise_waveform, resample_rate, format = "wav", encoding = "PCM_S", bits_per_sample = 16)
+                    noise_audio = noise_waveform[0].cpu().numpy()
+
+                noise_snr = random.uniform(snr_range[0], snr_range[1])
+                noise_db = 10 * np.log10(np.mean(noise_audio**2) + 1e-4)
+                noise_audio = np.sqrt(10**(
+                    (audio_db - noise_db - noise_snr) / 10)) * noise_audio
+                out_audio = audio + noise_audio
+
+            out_audio = out_audio / (np.max(np.abs(out_audio)) + 1e-4)
+            sample['wav'] = torch.from_numpy(out_audio).unsqueeze(0)
+
+        if debug:
+            print("final sample: ", sample, sample['wav'].shape)
+            print("时长: ",sample['wav'].shape[1]/sample['sample_rate'])
+        # torchaudio.backend.sox_io_backend.save('final_addnoise.wav', sample['wav'], sample['sample_rate'], format = "wav", encoding = "PCM_S", bits_per_sample = 16)
+        # torchaudio.backend.sox_io_backend.save('final_add_merge_noise.wav', sample['wav'], sample['sample_rate'], format = "wav", encoding = "PCM_S", bits_per_sample = 16)
+        # torchaudio.backend.sox_io_backend.save('final_addrever.wav', sample['wav'], sample['sample_rate'], format = "wav", encoding = "PCM_S", bits_per_sample = 16)
+        # exit(0)
+        yield sample
 
 def resample(data, resample_rate=16000):
     """ Resample data.
@@ -296,8 +459,10 @@ def compute_fbank(data,
                           dither=dither,
                           energy_floor=0.0,
                           sample_frequency=sample_rate)
-        sample['feat'] = mat
-        yield sample
+        if debug:
+          yield dict(key=sample['key'], label=sample['label'], txt=sample['txt'], tokens=sample['tokens'], wav=sample['wav'], sample_rate=sample['sample_rate'], feat=mat)
+        else :
+          yield dict(key=sample['key'], label=sample['label'], feat=mat)
 
 
 def compute_mfcc(data,
@@ -334,57 +499,37 @@ def compute_mfcc(data,
                          high_freq=high_freq,
                          low_freq=low_freq,
                          sample_frequency=sample_rate)
-        sample['feat'] = mat
-        yield sample
+        yield dict(key=sample['key'], label=sample['label'], feat=mat)
 
 
-def compute_log_mel_spectrogram(data,
-                                n_fft=400,
-                                hop_length=160,
-                                num_mel_bins=80,
-                                padding=0):
-    """ Extract log mel spectrogram, modified from openai-whisper, see:
-        - https://github.com/openai/whisper/blob/main/whisper/audio.py
-        - https://github.com/wenet-e2e/wenet/pull/2141#issuecomment-1811765040
+def __tokenize_by_bpe_model(sp, txt):
+    tokens = []
+    # CJK(China Japan Korea) unicode range is [U+4E00, U+9FFF], ref:
+    # https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
+    pattern = re.compile(r'([\u4e00-\u9fff])')
+    # Example:
+    #   txt   = "你好 ITS'S OKAY 的"
+    #   chars = ["你", "好", " ITS'S OKAY ", "的"]
+    chars = pattern.split(txt.upper())
+    mix_chars = [w for w in chars if len(w.strip()) > 0]
+    for ch_or_w in mix_chars:
+        # ch_or_w is a single CJK charater(i.e., "你"), do nothing.
+        if pattern.fullmatch(ch_or_w) is not None:
+            tokens.append(ch_or_w)
+        # ch_or_w contains non-CJK charaters(i.e., " IT'S OKAY "),
+        # encode ch_or_w using bpe_model.
+        else:
+            for p in sp.encode_as_pieces(ch_or_w):
+                tokens.append(p)
 
-        Args:
-            data: Iterable[{key, wav, label, sample_rate}]
-
-        Returns:
-            Iterable[{key, feat, label}]
-    """
-    for sample in data:
-        assert 'sample_rate' in sample
-        assert 'wav' in sample
-        assert 'key' in sample
-        assert 'label' in sample
-        sample_rate = sample['sample_rate']
-        waveform = sample['wav'].squeeze(0)  # (channel=1, sample) -> (sample,)
-        if padding > 0:
-            waveform = F.pad(waveform, (0, padding))
-        window = torch.hann_window(n_fft)
-        stft = torch.stft(waveform,
-                          n_fft,
-                          hop_length,
-                          window=window,
-                          return_complex=True)
-        magnitudes = stft[..., :-1].abs()**2
-
-        filters = torch.from_numpy(
-            librosa.filters.mel(sr=sample_rate,
-                                n_fft=n_fft,
-                                n_mels=num_mel_bins))
-        mel_spec = filters @ magnitudes
-
-        # NOTE(xcsong): https://github.com/openai/whisper/discussions/269
-        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-        log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
-        log_spec = (log_spec + 4.0) / 4.0
-        sample['feat'] = log_spec.transpose(0, 1)
-        yield sample
+    return tokens
 
 
-def tokenize(data, tokenizer: BaseTokenizer):
+def tokenize(data,
+             symbol_table,
+             bpe_model=None,
+             non_lang_syms=None,
+             split_with_space=False):
     """ Decode text to chars or BPE
         Inplace operation
 
@@ -394,9 +539,50 @@ def tokenize(data, tokenizer: BaseTokenizer):
         Returns:
             Iterable[{key, wav, txt, tokens, label, sample_rate}]
     """
+    if non_lang_syms is not None:
+        non_lang_syms_pattern = re.compile(r"(\[[^\[\]]+\]|<[^<>]+>|{[^{}]+})")
+    else:
+        non_lang_syms = {}
+        non_lang_syms_pattern = None
+
+    if bpe_model is not None:
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor()
+        sp.load(bpe_model)
+    else:
+        sp = None
+
     for sample in data:
         assert 'txt' in sample
-        tokens, label = tokenizer.tokenize(sample['txt'])
+        txt = sample['txt'].strip()
+        if non_lang_syms_pattern is not None:
+            parts = non_lang_syms_pattern.split(txt.upper())
+            parts = [w for w in parts if len(w.strip()) > 0]
+        else:
+            parts = [txt]
+
+        label = []
+        tokens = []
+        for part in parts:
+            if part in non_lang_syms:
+                tokens.append(part)
+            else:
+                if bpe_model is not None:
+                    tokens.extend(__tokenize_by_bpe_model(sp, part))
+                else:
+                    if split_with_space:
+                        part = part.split(" ")
+                    for ch in part:
+                        if ch == ' ':
+                            ch = "▁"
+                        tokens.append(ch)
+
+        for ch in tokens:
+            if ch in symbol_table:
+                label.append(symbol_table[ch])
+            elif '<unk>' in symbol_table:
+                label.append(symbol_table['<unk>'])
+
         sample['tokens'] = tokens
         sample['label'] = label
         yield sample
@@ -605,6 +791,117 @@ def batch(data, batch_type='static', batch_size=16, max_frames_in_batch=12000):
         logging.fatal('Unsupported batch type {}'.format(batch_type))
 
 
+def context_sampling(data,
+                     symbol_table,
+                     len_min,
+                     len_max,
+                     utt_num_context,
+                     batch_num_context,
+                     ):
+    """Perform context sampling by randomly selecting context phrases from the
+       utterance to obtain a context list for the entire batch
+
+        Args:
+            data: Iterable[List[{key, feat, label}]]
+
+        Returns:
+            Iterable[List[{key, feat, label, context_list}]]
+    """
+    rev_symbol_table = {}
+    for token in symbol_table:
+        rev_symbol_table[symbol_table[token]] = token
+    # if debug:
+    #     print("symbol_table", symbol_table)
+    #     print("rev_symbol_table", rev_symbol_table)
+        # symbol_table '▁YOUNG': 4996, '▁YOUR': 4997, '▁YOUTH': 4998, 'Z': 4999, 'ZZ': 5000, '<sos/eos>': 5001
+        # rev_symbol_table {0: '<blank>', 1: '<unk>', 2: "'", 3: '▁', 4: 'A', 5: '▁A', 6: 'AB', 7: '▁AB', 8: '▁ABANDON', 9: 'ABETH'
+    context_list_over_all = []
+    for sample in data:
+        if debug:
+            print("-> in context_sampling: ")
+            # print("example: ",sample, sample['wav'].shape)
+            # print("时长: ",sample['wav'].shape[1]/sample['sample_rate'])
+            print("example: ",sample)
+        batch_label = [sample[i]['label'] for i in range(len(sample))]
+        context_list = []
+        for utt_label in batch_label:
+            st_index_list = []
+            for i in range(len(utt_label)):
+                # if '▁' not in symbol_table:
+                #     st_index_list.append(i)
+                # elif rev_symbol_table[utt_label[i]][0] == '▁':
+                #     st_index_list.append(i)
+                st_index_list.append(i)
+            st_index_list.append(len(utt_label))
+
+            st_select = []
+            en_select = []
+            for _ in range(0, utt_num_context):
+                random_len = random.randint(min(len(st_index_list) - 1, len_min),
+                                            min(len(st_index_list) - 1, len_max))
+                random_index = random.randint(0, len(st_index_list) -
+                                              random_len - 1)
+                st_index = st_index_list[random_index]
+                en_index = st_index_list[random_index + random_len]
+                context_label = utt_label[st_index: en_index]
+                cross_flag = True
+                for i in range(len(st_select)):
+                    if st_index >= st_select[i] and st_index < en_select[i]:
+                        cross_flag = False
+                    elif en_index > st_select[i] and en_index <= en_select[i]:
+                        cross_flag = False
+                    elif st_index < st_select[i] and en_index > en_select[i]:
+                        cross_flag = False
+                if cross_flag:
+                    context_list.append(context_label)
+                    st_select.append(st_index)
+                    en_select.append(en_index)
+                if debug:
+                    print("context_label", context_label)
+                    print("context_list", context_list)
+
+        if len(context_list) > batch_num_context:
+            context_list_over_all = context_list
+        elif len(context_list) + len(context_list_over_all) > batch_num_context:
+            context_list_over_all.extend(context_list)
+            context_list_over_all = context_list_over_all[-batch_num_context:]
+        else:
+            context_list_over_all.extend(context_list)
+        context_list = context_list_over_all.copy()
+        context_list.insert(0, [0])
+        for i in range(len(context_list)):
+            context_list[i] = torch.tensor(context_list[i], dtype=torch.int32)
+        sample[0]['context_list'] = context_list
+        if debug:
+            print("-> in context_sampling final: ")
+            print("example: ",sample)
+            # exit(0)
+        yield sample
+
+
+def context_label_generate(label, context_list):
+    """ Generate context labels corresponding to the utterances based on
+        the context list
+    """
+    context_labels = []
+    for x in label:
+        cur_len = len(x)
+        context_label = []
+        count = 0
+        for i in range(cur_len):
+            for j in range(1, len(context_list)):
+                if i + len(context_list[j]) > cur_len:
+                    continue
+                if x[i:i + len(context_list[j])].equal(context_list[j]):
+                    count = max(count, len(context_list[j]))
+            if count > 0:
+                context_label.append(x[i])
+                count -= 1
+        context_label = torch.tensor(context_label, dtype=torch.int64)
+        context_labels.append(context_label)
+    return context_labels
+
+
 def padding(data):
     """ Padding the data into training data
 
@@ -626,11 +923,8 @@ def padding(data):
         sorted_labels = [
             torch.tensor(sample[i]['label'], dtype=torch.int64) for i in order
         ]
-        sorted_wavs = [sample[i]['wav'].squeeze(0) for i in order]
         label_lengths = torch.tensor([x.size(0) for x in sorted_labels],
                                      dtype=torch.int32)
-        wav_lengths = torch.tensor([x.size(0) for x in sorted_wavs],
-                                   dtype=torch.int32)
 
         padded_feats = pad_sequence(sorted_feats,
                                     batch_first=True,
@@ -638,20 +932,27 @@ def padding(data):
         padding_labels = pad_sequence(sorted_labels,
                                       batch_first=True,
                                       padding_value=-1)
-        padded_wavs = pad_sequence(sorted_wavs,
-                                   batch_first=True,
-                                   padding_value=0)
-        batch = {
-            "keys": sorted_keys,
-            "feats": padded_feats,
-            "target": padding_labels,
-            "feats_lengths": feats_lengths,
-            "target_lengths": label_lengths,
-            "pcm": padded_wavs,
-            "pcm_length": wav_lengths,
-        }
-        if 'speaker' in sample[0]:
-            speaker = torch.tensor([sample[i]['speaker'] for i in order],
-                                   dtype=torch.int32)
-            batch['speaker'] = speaker
-        yield batch
+
+        if 'context_list' not in sample[0]:
+            yield (sorted_keys, padded_feats, padding_labels, feats_lengths,
+                   label_lengths, [])
+        else:
+            context_lists = sample[0]['context_list']
+            context_list_lengths = \
+                torch.tensor([x.size(0) for x in context_lists], dtype=torch.int32)
+            padding_context_lists = pad_sequence(context_lists,
+                                                 batch_first=True,
+                                                 padding_value=-1)
+
+            sorted_context_labels = context_label_generate(sorted_labels,
+                                                           context_lists)
+            context_label_lengths = \
+                torch.tensor([x.size(0) for x in sorted_context_labels],
+                             dtype=torch.int32)
+            padding_context_labels = pad_sequence(sorted_context_labels,
+                                                  batch_first=True,
+                                                  padding_value=-1)
+            yield (sorted_keys, padded_feats, padding_labels,
+                   feats_lengths, label_lengths,
+                   [padding_context_lists, padding_context_labels,
+                    context_list_lengths, context_label_lengths])

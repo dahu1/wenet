@@ -19,12 +19,11 @@ import torch.distributed as dist
 from torch.utils.data import IterableDataset
 
 import wenet.dataset.processor as processor
-from wenet.text.base_tokenizer import BaseTokenizer
+from wenet.dataset.lmdb_data import LmdbData
 from wenet.utils.file_utils import read_lists
 
 
 class Processor(IterableDataset):
-
     def __init__(self, source, f, *args, **kw):
         assert callable(f)
         self.source = source
@@ -49,7 +48,6 @@ class Processor(IterableDataset):
 
 
 class DistributedSampler:
-
     def __init__(self, shuffle=True, partition=True):
         self.epoch = -1
         self.update()
@@ -102,7 +100,6 @@ class DistributedSampler:
 
 
 class DataList(IterableDataset):
-
     def __init__(self, lists, shuffle=True, partition=True):
         self.lists = lists
         self.sampler = DistributedSampler(shuffle, partition)
@@ -122,8 +119,10 @@ class DataList(IterableDataset):
 
 def Dataset(data_type,
             data_list_file,
-            tokenizer: BaseTokenizer,
+            symbol_table,
             conf,
+            bpe_model=None,
+            non_lang_syms=None,
             partition=True):
     """ Construct dataset from arguments
 
@@ -146,33 +145,49 @@ def Dataset(data_type,
     else:
         dataset = Processor(dataset, processor.parse_raw)
 
-    speaker_conf = conf.get('speaker_conf', None)
-    if speaker_conf is not None:
-        dataset = Processor(dataset, processor.parse_speaker, **speaker_conf)
-
-    dataset = Processor(dataset, processor.tokenize, tokenizer)
+    dataset = Processor(dataset, processor.tokenize, symbol_table, bpe_model,
+                        non_lang_syms, conf.get('split_with_space', False))
     filter_conf = conf.get('filter_conf', {})
     dataset = Processor(dataset, processor.filter, **filter_conf)
 
     resample_conf = conf.get('resample_conf', {})
+    resample_rate = resample_conf["resample_rate"]
+
+    # 重采样，通道合并
+    remix = conf.get('remix', False)
+    if remix:
+        dataset = Processor(dataset, processor.remix, **resample_conf)
+
     dataset = Processor(dataset, processor.resample, **resample_conf)
 
     speed_perturb = conf.get('speed_perturb', False)
     if speed_perturb:
         dataset = Processor(dataset, processor.speed_perturb)
 
+    # 加噪加混响
+    # aug_prob = conf.get('aug_prob', 0.6)
+    # aug_prob = 0.5
+    # aug_prob = 0.3
+    aug_prob = 0
+    # reverb_lmdb_file = "/ssdata5/xuecheng/asr_tools/wespeaker/examples/cnceleb/v2/general_rirs_noise/rirs.lmdb"
+    reverb_lmdb_file = "/ssdata5/xuecheng/asr_tools/wespeaker/examples/cnceleb/v2/data/rirs/lmdb"  # only rirs
+    noise_lmdb_file = "/ssdata5/xuecheng/asr_tools/wespeaker/examples/cnceleb/v2/general_rirs_noise/noise_full.lmdb"  # all noise
+    # noise_lmdb_file = "/ssdata5/xuecheng/asr_tools/wespeaker/examples/cnceleb/v2/data/musan/lmdb"  # only musan noise
+    # noise_lmdb_file = "/ssdata5/xuecheng/asr_tools/wespeaker/examples/cnceleb/v2/general_rirs_noise/tmp.lmdb" # multi channels noise
+    if (reverb_lmdb_file and noise_lmdb_file) and (aug_prob > 0.0):
+        reverb_data = LmdbData(reverb_lmdb_file)
+        noise_data = LmdbData(noise_lmdb_file)
+        dataset = Processor(dataset, processor.add_reverb_noise, reverb_data,
+                            noise_data, resample_rate, aug_prob)
+
     feats_type = conf.get('feats_type', 'fbank')
-    assert feats_type in ['fbank', 'mfcc', 'log_mel_spectrogram']
+    assert feats_type in ['fbank', 'mfcc']
     if feats_type == 'fbank':
         fbank_conf = conf.get('fbank_conf', {})
         dataset = Processor(dataset, processor.compute_fbank, **fbank_conf)
     elif feats_type == 'mfcc':
         mfcc_conf = conf.get('mfcc_conf', {})
         dataset = Processor(dataset, processor.compute_mfcc, **mfcc_conf)
-    elif feats_type == 'log_mel_spectrogram':
-        log_mel_spectrogram_conf = conf.get('log_mel_spectrogram_conf', {})
-        dataset = Processor(dataset, processor.compute_log_mel_spectrogram,
-                            **log_mel_spectrogram_conf)
 
     spec_aug = conf.get('spec_aug', True)
     spec_sub = conf.get('spec_sub', False)
@@ -198,5 +213,17 @@ def Dataset(data_type,
 
     batch_conf = conf.get('batch_conf', {})
     dataset = Processor(dataset, processor.batch, **batch_conf)
+
+    context_conf = conf.get('context_conf', {})
+
+    # rev_symbol_table = dict()
+    # for token in symbol_table:
+    #     rev_symbol_table[symbol_table[token]] = token
+
+    if len(context_conf) != 0:
+        dataset = Processor(dataset, processor.context_sampling,
+                            symbol_table, **context_conf)
+                            # symbol_table, rev_symbol_table, **context_conf)
+
     dataset = Processor(dataset, processor.padding)
     return dataset
