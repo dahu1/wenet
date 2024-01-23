@@ -1,0 +1,100 @@
+
+name: "scoring"
+backend: "python"
+max_batch_size: 128
+
+parameters [
+  {
+    key: "vocabulary",
+    value: { string_value: "onnx_dir/words.txt"}
+  },
+  {
+    key: "bidecoder",
+    value: { string_value: "0"}
+  },
+  {
+    key: "lm_path",
+    value: { string_value: "None"}
+  },
+  {
+   key: "hotwords_path",
+   value : { string_value: "onnx_dir/71_word_weight"}
+   # value : { string_value: "onnx_dir/71_word"}
+  },
+  {
+   key: "context_pt",
+   value : { string_value: "onnx_dir/context.pt"}
+  },
+  {
+   key: "graph_biasing",
+   value : { string_value: "1"}
+  },
+  {
+   key: "deep_biasing",
+   value : { string_value: "1"}
+  },
+  {
+   key: "deep_biasing_score",
+   value : { string_value: "1.0"}
+  }
+]
+input [
+  {
+    name: "encoder_out"
+    data_type: TYPE_FP32
+    dims: [-1, 512] # [-1, feature_size]
+  },
+  {
+    name: "encoder_out_lens"
+    data_type: TYPE_INT32
+    dims: [1]
+    reshape: { shape: [ ] }
+  },
+  {
+    name: "batch_log_probs"
+    data_type: TYPE_FP32
+    dims: [-1, 10] #[-1, beam_size]
+  },
+  {
+    name: "batch_log_probs_idx"
+    data_type: TYPE_INT64
+    dims: [-1, 10]
+  },
+  {
+    name: "ctc_log_probs"
+    data_type: TYPE_FP32
+    dims: [-1, 8844]
+  },
+  {
+    name: "hot_word"
+    data_type: TYPE_STRING
+    dims: [1]
+    reshape: { shape: [ ] }
+  }
+]
+output [
+  {
+    name: "OUTPUT0"
+    data_type: TYPE_STRING
+    dims: [1]
+  },
+  {
+    name: "OUTPUT1"
+    data_type: TYPE_STRING
+    dims: [1]
+  },
+  {
+    name: "OUTPUT2"
+    data_type: TYPE_FP32
+    dims: [1]
+  }
+]
+dynamic_batching {
+    preferred_batch_size: [ 32, 64 ]
+  }
+instance_group [
+    {
+      count: 4
+      kind: KIND_CPU
+    }
+  ]

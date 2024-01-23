@@ -1,0 +1,60 @@
+
+name: "decoder"
+backend: "onnxruntime"
+default_model_filename: "decoder.onnx"
+
+max_batch_size: 640
+input [
+  {
+    name: "encoder_out"
+    data_type: TYPE_FP32
+    dims: [-1, 512] # [-1, feature_size]
+  },
+  {
+    name: "encoder_out_lens"
+    data_type: TYPE_INT32
+    dims: [1]
+    reshape: { shape: [ ] }
+  },
+  {
+    name: "hyps_pad_sos_eos"
+    data_type: TYPE_INT64
+    dims: [10, -1]
+  },
+ {
+    name: "hyps_lens_sos"
+    data_type: TYPE_INT32
+    dims: [10]
+  },
+  {
+    name: "ctc_score"
+    data_type: TYPE_FP32
+    dims: [10]
+  }
+]
+
+output [
+  {
+    name: "score"
+    data_type: TYPE_FP32
+    dims: [10]
+  },
+  {
+    name: "best_index"
+    data_type: TYPE_INT64
+    dims: [1]
+    reshape: { shape: [ ] }
+  }
+]
+
+dynamic_batching {
+    preferred_batch_size: [ 32, 64 ]
+  }
+
+instance_group [
+    {
+      count: 2
+      kind: KIND_GPU
+    }
+]
+
