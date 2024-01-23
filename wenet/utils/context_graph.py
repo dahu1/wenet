@@ -1,24 +1,17 @@
-# Copyright    2023  Xiaomi Corp.        (authors: Wei Kang)
-#              2023  Binbin Zhang (binbzha@qq.com)
-#              2023  Kaixun Huang
-#              2023  Chengdong Liang (liangchengdong@mail.nwpu.edu.cn)
-# See ../LICENSE for clarification regarding multiple authors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+import torch
+from torch.nn.utils.rnn import pad_sequence
 
-from wenet.text.tokenize_utils import tokenize_by_bpe_model
-from typing import Dict, List, Tuple
-from collections import deque
+from wenet.dataset.processor import __tokenize_by_bpe_model
+from wenet.transformer.context_module import ContextModule
+from wenet.transformer.ctc import CTC
+
+from typing import Dict, List
+
+import logging
+logging.basicConfig(level=logging.INFO,
+                            format='%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s')
+logger = logging.getLogger('streaming-interface')
+logger.setLevel(logging.INFO)
 
 
 def tokenize(context_list_path, symbol_table, bpe_model=None):
@@ -37,12 +30,13 @@ def tokenize(context_list_path, symbol_table, bpe_model=None):
 
     context_list = []
     for context_txt in context_txts:
-        context_txt = context_txt.strip()
+        # context_txt = context_txt.strip()
+        context_txt = context_txt.strip().split("\t")[0]
 
         labels = []
         tokens = []
         if bpe_model is not None:
-            tokens = tokenize_by_bpe_model(sp, context_txt)
+            tokens = __tokenize_by_bpe_model(sp, context_txt)
         else:
             for ch in context_txt:
                 if ch == ' ':
@@ -51,215 +45,321 @@ def tokenize(context_list_path, symbol_table, bpe_model=None):
         for ch in tokens:
             if ch in symbol_table:
                 labels.append(symbol_table[ch])
+                # labels.append(ch)
             elif '<unk>' in symbol_table:
                 labels.append(symbol_table['<unk>'])
+                # labels.append('<unk>')
         context_list.append(labels)
     return context_list
 
+def tokenize_dict(context_dict, symbol_table, bpe_model=None):
+    if bpe_model is not None:
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor()
+        sp.load(bpe_model)
+    else:
+        sp = None
 
-class ContextState:
-    """The state in ContextGraph"""
+    context_list = []
+    for context_txt, graph_score in context_dict.items():
 
-    def __init__(
-        self,
-        id: int,
-        token: int,
-        token_score: float,
-        node_score: float,
-        output_score: float,
-        is_end: bool,
-    ):
-        """Create a ContextState.
+        labels = []
+        tokens = []
+        if bpe_model is not None:
+            tokens = __tokenize_by_bpe_model(sp, context_txt)
+        else:
+            for ch in context_txt:
+                if ch == ' ':
+                    ch = "▁"
+                tokens.append(ch)
+        for ch in tokens:
+            if ch in symbol_table:
+                labels.append(symbol_table[ch])
+                # labels.append(ch)
+            elif '<unk>' in symbol_table:
+                labels.append(symbol_table['<unk>'])
+                # labels.append('<unk>')
+        item = {"key": labels, "value": graph_score}
+        context_list.append(item)
+    return context_list
 
-        Args:
-          id:
-            The node id, only for visualization now. A node is in [0, graph.num_nodes).
-            The id of the root node is always 0.
-          token:
-            The token id.
-          token_score:
-            The bonus for each token during decoding, which will hopefully
-            boost the token up to survive beam search.
-          node_score:
-            The accumulated bonus from root of graph to current node, it will be
-            used to calculate the score for fail arc.
-          output_score:
-            The total scores of matched phrases, sum of the node_score of all
-            the output node for current node.
-          is_end:
-            True if current token is the end of a context.
-        """
-        self.id = id
-        self.token = token
-        self.token_score = token_score
-        self.node_score = node_score
-        self.output_score = output_score
-        self.is_end = is_end
-        self.next = {}
-        self.fail = None
-        self.output = None
-
+def tbbm(sp, context_txt):
+    return __tokenize_by_bpe_model(sp, context_txt)
 
 class ContextGraph:
-    """The ContextGraph is modified from Aho-Corasick which is mainly
-    a Trie with a fail arc for each node.
-    See https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_algorithm for more details
-    of Aho-Corasick algorithm.
-
-    A ContextGraph contains some words / phrases that we expect to boost their
-    scores during decoding. If the substring of a decoded sequence matches the word / phrase  # noqa
-    in the ContextGraph, we will give the decoded sequence a bonus to make it survive
-    beam search.
+    """ Context decoding graph, constructing graph using dict instead of WFST
+        Args:
+            context_list_path(str): context list path
+            bpe_model(str): model for english bpe part
+            context_graph_score(float): context score for each token
     """
-
     def __init__(self,
                  context_list_path: str,
                  symbol_table: Dict[str, int],
                  bpe_model: str = None,
-                 context_score: float = 6.0):
-        """Initialize a ContextGraph with the given ``context_score``.
-
-        A root node will be created (**NOTE:** the token of root is hardcoded to -1).
-
-        Args:
-          context_score:
-            The bonus score for each token(note: NOT for each word/phrase, it means longer  # noqa
-            word/phrase will have larger bonus score, they have to be matched though).
-        """
-        self.context_score = context_score
+                 context_graph_score: float = 2.0):
+        self.context_graph_score = context_graph_score
         self.context_list = tokenize(context_list_path, symbol_table,
                                      bpe_model)
-        self.num_nodes = 0
-        self.root = ContextState(
-            id=self.num_nodes,
-            token=-1,
-            token_score=0,
-            node_score=0,
-            output_score=0,
-            is_end=False,
-        )
-        self.root.fail = self.root
-        self.build_graph(self.context_list)
+        # logger.info('self.context_list: {}'.format(self.context_list))
+        # self.context_list: [[793, 2026, 416], [2218, 6125]]
+        self.graph = {0: {}}
+        self.graph_size = 0
+        self.state2token = {}
+        self.back_score = {0: 0.0}
 
-    def build_graph(self, token_ids: List[List[int]]):
-        """Build the ContextGraph from a list of token list.
-        It first build a trie from the given token lists, then fill the fail arc
-        for each trie node.
+        # self.build_graph(self.context_list)
+        # exit(0)
 
-        See https://en.wikipedia.org/wiki/Trie for how to build a trie.
+        self.graph1 = {0: {}}
+        self.graph_size1 = 0
+        self.state2token1 = {}
+        self.back_score1 = {0: 0.0}
+        self.state_score1 = {0: 0}
 
-        Args:
-          token_ids:
-            The given token lists to build the ContextGraph, it is a list of token list,
-            each token list contains the token ids for a word/phrase. The token id
-            could be an id of a char (modeling with single Chinese char) or an id
-            of a BPE (modeling with BPEs).
+        self.context_dict = {
+             "HUD": 2, "万科": 2, "三六零影像": 2, "中旅": 2,
+             "中海": 2, "中铁建": 2, "天河": 2, "星河": 2,
+             "华润": 2, "华润公园": 2, "江缦": 2   }
+        self.context_dict = {'你好': 1, '天气': 2}
+
+        self.context_dict = dict()
+        for line in  open(context_list_path):
+            lin = line.strip().split("\t")
+            assert len(lin) == 2
+            k = lin[0]
+            v = float(lin[1])
+            self.context_dict[k] = v
+
+        self.context_list1 = tokenize_dict(self.context_dict, symbol_table, bpe_model)
+        # print(self.context_list1)
+        # exit(0)
+        # [{'key': ['你', '好'], 'value': 1}, {'key': ['天', '气'], 'value': 2}]
+        # [{'key': [2410, 3404], 'value': 1}, {'key': [3368, 4986], 'value': 2}]
+        self.build_graph_dict(self.context_list1)
+        # exit(0)
+
+        self.graph_biasing = False
+        self.deep_biasing = False
+        self.deep_biasing_score = 1.0
+        self.context_filtering = True
+        self.filter_threshold = -4.0
+
+    def build_graph_dict(self, context_list1):
+        """ 构造上下文解码图，对每个热词的非终结标记添加负得分的弧返回起始状态，对终结标记添加 0 得分的弧返回起始状态。 根据提供的热词字典构图
+        增加了每个热词的权重，作为热词字典的值，意味着每个热词的得分可能不一样
+        '华润': 2, '华润公园': 3，这种情况下，华润 的权重也变成3了，以最长的热词得分为主，方便计算回退概率，
+        self.graph1 {0: {'华': 20}, 20: {'润': 21}, 21: {'公': 22}, 22: {'园': 23}, 23: {}}
+        self.state2token1 20: '华', 21: '润', 22: '公', 23: '园'
+        self.state_score1 20: 3, 21: 3, 22: 3, 23: 3
+        self.back_score1 20: -3, 21: 0, 22: -9, 23: 0
         """
-        for tokens in token_ids:
-            node = self.root
-            for i, token in enumerate(tokens):
-                if token not in node.next:
-                    self.num_nodes += 1
-                    is_end = i == len(tokens) - 1
-                    node_score = node.node_score + self.context_score
-                    node.next[token] = ContextState(
-                        id=self.num_nodes,
-                        token=token,
-                        token_score=self.context_score,
-                        node_score=node_score,
-                        output_score=node_score if is_end else 0,
-                        is_end=is_end,
-                    )
-                node = node.next[token]
-        self._fill_fail_output()  # AC
-
-    def _fill_fail_output(self):
-        """This function fills the fail arc for each trie node, it can be computed
-        in linear time by performing a breadth-first search starting from the root.
-        See https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_algorithm for the
-        details of the algorithm.
-        """
-        queue = deque()
-        for token, node in self.root.next.items():
-            node.fail = self.root
-            queue.append(node)
-        while queue:
-            current_node = queue.popleft()
-            for token, node in current_node.next.items():
-                fail = current_node.fail
-                if token in fail.next:
-                    fail = fail.next[token]
+        self.graph1 = {0: {}}
+        self.graph_size1 = 0
+        self.state2token1 = {}
+        self.back_score1 = {0: 0.0}
+        self.state_score1 = {0: 0}
+        for item in context_list1 :
+            context_token = item["key"]
+            graph_score = item["value"]
+            now_state = 0
+            for i in range(len(context_token)):
+                if context_token[i] in self.graph1[now_state]:
+                    now_state = self.graph1[now_state][context_token[i]]
+                    self.state_score1[now_state] = max(graph_score, self.state_score1[now_state])
+                    if i == len(context_token) - 1:
+                        self.back_score1[now_state] = 0
+                    else:
+                        if self.back_score1[now_state] !=0 :
+                            self.back_score1[now_state] = -(i + 1) * self.state_score1[now_state]
                 else:
-                    fail = fail.fail
-                    while token not in fail.next:
-                        fail = fail.fail
-                        if fail.token == -1:  # root
-                            break
-                    if token in fail.next:
-                        fail = fail.next[token]
-                node.fail = fail
-                # fill the output arc
-                output = node.fail
-                while not output.is_end:
-                    output = output.fail
-                    if output.token == -1:  # root
-                        output = None
-                        break
-                node.output = output
-                node.output_score += 0 if output is None else output.output_score
-                queue.append(node)
+                    self.graph_size1 += 1
+                    self.graph1[self.graph_size1] = {}
+                    self.graph1[now_state][context_token[i]] = self.graph_size1
+                    now_state = self.graph_size1
+                    if i != len(context_token) - 1:
+                        self.back_score1[now_state] = -(i + 1) * graph_score
+                    else:
+                        self.back_score1[now_state] = 0
+                    self.state2token1[now_state] = context_token[i]
+                    self.state_score1[now_state] = graph_score
+        # logger.info('self.graph1: {} self.graph_size1: {}'.format(self.graph1, self.graph_size1))
+        # logger.info('self.back_score1: {}'.format(self.back_score1))
+        # logger.info('self.state2token1: {}'.format(self.state2token1))
+        # logger.info('self.state_score1: {}'.format(self.state_score1))
 
-    def forward_one_step(self, state: ContextState,
-                         token: int) -> Tuple[float, ContextState]:
-        """Search the graph with given state and token.
-
-        Args:
-          state:
-            The given token containing trie node to start.
-          token:
-            The given token.
-
-        Returns:
-          Return a tuple of score and next state.
+    def find_graph_dict_next_state(self, now_state: int, token: int):
+        """ 
+            用当前状态的标记作为输入搜索一个弧，返回弧上的分数和它所指向的状态。如果没有匹配，则返回到起始状态，并从起始状态执行额外的搜索，以避免由于不匹配而消耗令牌。
         """
-        node = None
-        score = 0
-        # token matched
-        if token in state.next:
-            node = state.next[token]
-            score = node.token_score
+        if token in self.graph1[now_state]:
+            state = self.graph1[now_state][token]
+            return self.graph1[now_state][token], self.state_score1[state]
+        back_score = self.back_score1[now_state]
+        now_state = 0
+        if token in self.graph1[now_state]:
+            state = self.graph1[now_state][token]
+            return self.graph1[now_state][token], \
+                back_score + self.state_score1[state]
+        return 0, back_score
+
+    def build_graph(self, context_list: List[List[int]]):
+        """ Constructing the context decoding graph, add arcs with negative
+            scores returning to the starting state for each non-terminal tokens
+            of hotwords, and add arcs with scores of 0 returning to the starting
+            state for terminal tokens.
+            构造上下文解码图，对每个热词的非终结标记添加负得分的弧返回起始状态，对终结标记添加 0 得分的弧返回起始状态。
+        """
+        self.graph = {0: {}}
+        self.graph_size = 0
+        self.state2token = {}
+        self.back_score = {0: 0.0}
+        # self.context_list: [[793, 2026, 416], [2218, 6125]]
+        for context_token in context_list:
+            now_state = 0
+            for i in range(len(context_token)):
+                if context_token[i] in self.graph[now_state]:
+                    now_state = self.graph[now_state][context_token[i]]
+                    if i == len(context_token) - 1:
+                        self.back_score[now_state] = 0
+                else:
+                    self.graph_size += 1
+                    self.graph[self.graph_size] = {}
+                    self.graph[now_state][context_token[i]] = self.graph_size
+                    now_state = self.graph_size
+                    if i != len(context_token) - 1:
+                        self.back_score[now_state] = \
+                            -(i + 1) * self.context_graph_score
+                    else:
+                        self.back_score[now_state] = 0
+                    self.state2token[now_state] = context_token[i]
+        # logger.info('self.graph: {} self.graph_size: {}'.format(self.graph, self.graph_size))
+        # logger.info('self.back_score : {}'.format(self.back_score))
+        # logger.info('self.state2token: {}'.format(self.state2token))
+
+    def find_next_state(self, now_state: int, token: int):
+        """ Search for an arc with the input being a token from the current state,
+            returning the score on the arc and the state it points to. If there is
+            no match, return to the starting state and perform an additional search
+            from the starting state to avoid token consumption due to mismatches.
+            用当前状态的标记作为输入搜索一个弧，返回弧上的分数和它所指向的状态。如果没有匹配，则返回到起始状态，并从起始状态执行额外的搜索，以避免由于不匹配而消耗令牌。
+        """
+        if token in self.graph[now_state]:
+            return self.graph[now_state][token], self.context_graph_score
+        back_score = self.back_score[now_state]
+        now_state = 0
+        if token in self.graph[now_state]:
+            return self.graph[now_state][token], \
+                back_score + self.context_graph_score
+        return 0, back_score
+
+    def get_context_list_tensor(self, context_list: List[List[int]]):
+        """Add 0 as no-bias in the context list and obtain the tensor
+           form of the context list
+        """
+        context_list_tensor = [torch.tensor([0], dtype=torch.int32)]
+        for context_token in context_list:
+            context_list_tensor.append(torch.tensor(context_token, dtype=torch.int32))
+        context_list_lengths = torch.tensor([x.size(0) for x in context_list_tensor],
+                                            dtype=torch.int32)
+        context_list_tensor = pad_sequence(context_list_tensor,
+                                           batch_first=True,
+                                           padding_value=-1)
+        return context_list_tensor, context_list_lengths
+
+    def forward_deep_biasing(self,
+                             encoder_out: torch.Tensor,
+                             context_module: ContextModule,
+                             ctc: CTC):
+        """Apply deep biasing based on encoder output and context list
+        """
+        if self.context_filtering:
+            ctc_probs = ctc.log_softmax(encoder_out).squeeze(0)
+            filtered_context_list = self.two_stage_filtering(
+                self.context_list, ctc_probs)
+            context_list, context_list_lengths = self. \
+                get_context_list_tensor(filtered_context_list)
         else:
-            # token not matched
-            # We will trace along the fail arc until it matches the token or reaching
-            # root of the graph.
-            node = state.fail
-            while token not in node.next:
-                node = node.fail
-                if node.token == -1:  # root
-                    break
+            context_list, context_list_lengths = self. \
+                get_context_list_tensor(self.context_list)
+        context_list = context_list.to(encoder_out.device)
 
-            if token in node.next:
-                node = node.next[token]
+        # logger.info('context_list: {}, shape: {}, context_list_lengths: {}'.format(context_list, context_list.shape, context_list_lengths))
+        context_emb = context_module. \
+            forward_context_emb(context_list, context_list_lengths)
+        # logger.info('context_emb: {}, shape: {}'.format(context_emb, context_emb.shape))
+        encoder_out, _ = \
+            context_module(context_emb, encoder_out,
+                           self.deep_biasing_score, True)
+        return encoder_out
 
-            # The score of the fail path
-            score = node.node_score - state.node_score
-        assert node is not None
-        return (score + node.output_score, node)
-
-    def finalize(self, state: ContextState) -> Tuple[float, ContextState]:
-        """When reaching the end of the decoded sequence, we need to finalize
-        the matching, the purpose is to subtract the added bonus score for the
-        state that is not the end of a word/phrase.
-
-        Args:
-          state:
-            The given state(trie node).
-
-        Returns:
-          Return a tuple of score and next state. If state is the end of a word/phrase
-          the score is zero, otherwise the score is the score of a implicit fail arc
-          to root. The next state is always root.
+    def two_stage_filtering(self,
+                            context_list: List[List[int]],
+                            ctc_posterior: torch.Tensor,
+                            filter_window_size: int = 64):
+        """Calculate PSC and SOC for context phrase filtering,
+           refer to: https://arxiv.org/abs/2301.06735
         """
-        # The score of the fail arc
-        score = -state.node_score
-        return (score, self.root)
+        if len(context_list) == 0:
+            return context_list
+
+        SOC_score = {}
+        for t in range(1, ctc_posterior.shape[0]):
+            if t % (filter_window_size // 2) != 0 and t != ctc_posterior.shape[0] - 1:
+                continue
+            # calculate PSC
+            PSC_score = {}
+            max_posterior, _ = torch.max(ctc_posterior[max(0,
+                                         t - filter_window_size):t, :],
+                                         dim=0, keepdim=False)
+            max_posterior = max_posterior.tolist()
+            for i in range(len(context_list)):
+                score = sum(max_posterior[j] for j in context_list[i]) \
+                    / len(context_list[i])
+                PSC_score[i] = max(SOC_score.get(i, -float('inf')), score)
+            PSC_filtered_index = []
+            for i in PSC_score:
+                if PSC_score[i] > self.filter_threshold:
+                    PSC_filtered_index.append(i)
+            if len(PSC_filtered_index) == 0:
+                continue
+            filtered_context_list = []
+            for i in PSC_filtered_index:
+                filtered_context_list.append(context_list[i])
+
+            # calculate SOC
+            win_posterior = ctc_posterior[max(0, t - filter_window_size):t, :]
+            win_posterior = win_posterior.unsqueeze(0) \
+                .expand(len(filtered_context_list), -1, -1)
+            select_win_posterior = []
+            for i in range(len(filtered_context_list)):
+                select_win_posterior.append(torch.index_select(
+                    win_posterior[0], 1,
+                    torch.tensor(filtered_context_list[i],
+                                 device=ctc_posterior.device)).transpose(0, 1))
+            select_win_posterior = \
+                pad_sequence(select_win_posterior,
+                             batch_first=True).transpose(1, 2).contiguous()
+            dp = torch.full((select_win_posterior.shape[0],
+                             select_win_posterior.shape[2]),
+                            -10000.0, dtype=torch.float32,
+                            device=select_win_posterior.device)
+            dp[:, 0] = select_win_posterior[:, 0, 0]
+            for win_t in range(1, select_win_posterior.shape[1]):
+                temp = dp[:, :-1] + select_win_posterior[:, win_t, 1:]
+                idx = torch.where(temp > dp[:, 1:])
+                idx_ = (idx[0], idx[1] + 1)
+                dp[idx_] = temp[idx]
+                dp[:, 0] = \
+                    torch.where(select_win_posterior[:, win_t, 0] > dp[:, 0],
+                                select_win_posterior[:, win_t, 0], dp[:, 0])
+            for i in range(len(filtered_context_list)):
+                SOC_score[PSC_filtered_index[i]] = \
+                    max(SOC_score.get(PSC_filtered_index[i], -float('inf')),
+                        dp[i][len(filtered_context_list[i]) - 1]
+                        / len(filtered_context_list[i]))
+        filtered_context_list = []
+        for i in range(len(context_list)):
+            if SOC_score.get(i, -float('inf')) > self.filter_threshold:
+                filtered_context_list.append(context_list[i])
+        return filtered_context_list

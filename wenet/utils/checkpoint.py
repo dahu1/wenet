@@ -24,14 +24,17 @@ import datetime
 
 
 def load_checkpoint(model: torch.nn.Module, path: str) -> dict:
-    logging.info('Checkpoint: loading from checkpoint %s' % path)
-    checkpoint = torch.load(path, map_location='cpu')
-    missing_keys, unexpected_keys = model.load_state_dict(checkpoint,
-                                                          strict=False)
-    for key in missing_keys:
-        logging.info("missing tensor: {}".format(key))
-    for key in unexpected_keys:
-        logging.info("unexpected tensor: {}".format(key))
+    if torch.cuda.is_available():
+        logging.info('Checkpoint: loading from checkpoint %s for GPU' % path)
+        checkpoint = torch.load(path)
+    else:
+        logging.info('Checkpoint: loading from checkpoint %s for CPU' % path)
+        checkpoint = torch.load(path, map_location='cpu')
+    model.load_state_dict(checkpoint, strict=False)
+    if hasattr(model, 'context_module') and \
+       hasattr(model.context_module, 'context_decoder_ctc_linear'):
+        model.context_module.context_decoder_ctc_linear \
+            .load_state_dict(model.ctc.ctc_lo.state_dict())
     info_path = re.sub('.pt$', '.yaml', path)
     configs = {}
     if os.path.exists(info_path):

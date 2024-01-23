@@ -13,11 +13,6 @@
 # limitations under the License.
 
 import torch
-
-from wenet.k2.model import K2Model
-from wenet.paraformer.cif import Cif
-from wenet.paraformer.layers import SanmDecoder, SanmEncoder
-from wenet.paraformer.paraformer import Paraformer, Predictor
 from wenet.transducer.joint import TransducerJoint
 from wenet.transducer.predictor import (ConvPredictor, EmbeddingPredictor,
                                         RNNPredictor)
@@ -25,68 +20,20 @@ from wenet.transducer.transducer import Transducer
 from wenet.transformer.asr_model import ASRModel
 from wenet.transformer.cmvn import GlobalCMVN
 from wenet.transformer.ctc import CTC
-from wenet.transformer.encoder import TransformerEncoder, ConformerEncoder
 from wenet.transformer.decoder import BiTransformerDecoder, TransformerDecoder
+from wenet.transformer.encoder import ConformerEncoder, TransformerEncoder
+from wenet.transformer.context_module import ContextModule
 from wenet.branchformer.encoder import BranchformerEncoder
-from wenet.e_branchformer.encoder import EBranchformerEncoder
 from wenet.squeezeformer.encoder import SqueezeformerEncoder
 from wenet.efficient_conformer.encoder import EfficientConformerEncoder
-from wenet.ctl_model.encoder import DualTransformerEncoder, DualConformerEncoder
-from wenet.ctl_model.asr_model_ctl import CTLModel
-from wenet.whisper.whisper import Whisper
+from wenet.paraformer.paraformer import Paraformer
+from wenet.cif.predictor import Predictor
 from wenet.utils.cmvn import load_cmvn
-from wenet.utils.checkpoint import load_checkpoint, load_trained_modules
-
-WENET_ENCODER_CLASSES = {
-    "transformer": TransformerEncoder,
-    "conformer": ConformerEncoder,
-    "squeezeformer": SqueezeformerEncoder,
-    "efficientConformer": EfficientConformerEncoder,
-    "branchformer": BranchformerEncoder,
-    "e_branchformer": EBranchformerEncoder,
-    "dual_transformer": DualTransformerEncoder,
-    "dual_conformer": DualConformerEncoder,
-    'sanm_encoder': SanmEncoder,
-}
-
-WENET_DECODER_CLASSES = {
-    "transformer": TransformerDecoder,
-    "bitransformer": BiTransformerDecoder,
-    "sanm_decoder": SanmDecoder,
-}
-
-WENET_CTC_CLASSES = {
-    "ctc": CTC,
-}
-
-WENET_PREDICTOR_CLASSES = {
-    "rnn": RNNPredictor,
-    "embedding": EmbeddingPredictor,
-    "conv": ConvPredictor,
-    "cif_predictor": Cif,
-    "paraformer_predictor": Predictor,
-}
-
-WENET_JOINT_CLASSES = {
-    "transducer_joint": TransducerJoint,
-}
-
-WENET_MODEL_CLASSES = {
-    "asr_model": ASRModel,
-    "ctl_model": CTLModel,
-    "whisper": Whisper,
-    "k2_model": K2Model,
-    "transducer": Transducer,
-    'paraformer': Paraformer,
-}
 
 
-def init_model(args, configs):
-
-    # TODO(xcsong): Forcefully read the 'cmvn' attribute.
-    if configs.get('cmvn', None) == 'global_cmvn':
-        mean, istd = load_cmvn(configs['cmvn_conf']['cmvn_file'],
-                               configs['cmvn_conf']['is_json_cmvn'])
+def init_model(configs):
+    if configs['cmvn_file'] is not None:
+        mean, istd = load_cmvn(configs['cmvn_file'], configs['is_json_cmvn'])
         global_cmvn = GlobalCMVN(
             torch.from_numpy(mean).float(),
             torch.from_numpy(istd).float())
@@ -98,80 +45,93 @@ def init_model(args, configs):
 
     encoder_type = configs.get('encoder', 'conformer')
     decoder_type = configs.get('decoder', 'bitransformer')
-    ctc_type = configs.get('ctc', 'ctc')
 
-    encoder = WENET_ENCODER_CLASSES[encoder_type](
-        input_dim,
-        global_cmvn=global_cmvn,
-        **configs['encoder_conf'],
-        **configs['encoder_conf']['efficient_conf']
-        if 'efficient_conf' in configs['encoder_conf'] else {})
+    if encoder_type == 'conformer':
+        encoder = ConformerEncoder(input_dim,
+                                   global_cmvn=global_cmvn,
+                                   **configs['encoder_conf'])
+    elif encoder_type == 'squeezeformer':
+        encoder = SqueezeformerEncoder(input_dim,
+                                       global_cmvn=global_cmvn,
+                                       **configs['encoder_conf'])
+    elif encoder_type == 'efficientConformer':
+        encoder = EfficientConformerEncoder(input_dim,
+                                            global_cmvn=global_cmvn,
+                                            **configs['encoder_conf'],
+                                            **configs['encoder_conf']
+                                            ['efficient_conf']
+                                            if 'efficient_conf' in
+                                               configs['encoder_conf'] else {})
+    elif encoder_type == 'branchformer':
+        encoder = BranchformerEncoder(input_dim,
+                                      global_cmvn=global_cmvn,
+                                      **configs['encoder_conf'])
+    else:
+        encoder = TransformerEncoder(input_dim,
+                                     global_cmvn=global_cmvn,
+                                     **configs['encoder_conf'])
+    if decoder_type == 'transformer':
+        decoder = TransformerDecoder(vocab_size, encoder.output_size(),
+                                     **configs['decoder_conf'])
+    else:
+        assert 0.0 < configs['model_conf']['reverse_weight'] < 1.0
+        assert configs['decoder_conf']['r_num_blocks'] > 0
+        decoder = BiTransformerDecoder(vocab_size, encoder.output_size(),
+                                       **configs['decoder_conf'])
+    ctc = CTC(vocab_size, encoder.output_size())
 
-    decoder = WENET_DECODER_CLASSES[decoder_type](vocab_size,
-                                                  encoder.output_size(),
-                                                  **configs['decoder_conf'])
+    context_module_type = configs.get('context_module', '')
+    if context_module_type == 'cppn':
+        context_module = ContextModule(vocab_size,
+                                       **configs['context_module_conf'])
+    else:
+        context_module = None
 
-    ctc = WENET_CTC_CLASSES[ctc_type](
-        vocab_size,
-        encoder.output_size(),
-        blank_id=configs['ctc_conf']['ctc_blank_id']
-        if 'ctc_conf' in configs else 0)
-
-    model_type = configs.get('model', 'asr_model')
-    if model_type == "transducer":
+    # Init joint CTC/Attention or Transducer model
+    if 'predictor' in configs:
         predictor_type = configs.get('predictor', 'rnn')
-        joint_type = configs.get('joint', 'transducer_joint')
-        predictor = WENET_PREDICTOR_CLASSES[predictor_type](
-            vocab_size, **configs['predictor_conf'])
-        joint = WENET_JOINT_CLASSES[joint_type](vocab_size,
-                                                **configs['joint_conf'])
-        model = WENET_MODEL_CLASSES[model_type](
-            vocab_size=vocab_size,
-            blank=0,
-            predictor=predictor,
-            encoder=encoder,
-            attention_decoder=decoder,
-            joint=joint,
-            ctc=ctc,
-            special_tokens=configs.get('tokenizer_conf',
-                                       {}).get('special_tokens', None),
-            **configs['model_conf'])
-    elif model_type == 'paraformer':
-        predictor_type = configs.get('predictor', 'cif')
-        predictor = WENET_PREDICTOR_CLASSES[predictor_type](
-            **configs['predictor_conf'])
-        model = WENET_MODEL_CLASSES[model_type](
-            vocab_size=vocab_size,
-            encoder=encoder,
-            decoder=decoder,
-            predictor=predictor,
-            ctc=ctc,
-            **configs['model_conf'],
-            special_tokens=configs.get('tokenizer_conf',
-                                       {}).get('special_tokens', None),
-        )
+        if predictor_type == 'rnn':
+            predictor = RNNPredictor(vocab_size, **configs['predictor_conf'])
+        elif predictor_type == 'embedding':
+            predictor = EmbeddingPredictor(vocab_size,
+                                           **configs['predictor_conf'])
+            configs['predictor_conf']['output_size'] = configs[
+                'predictor_conf']['embed_size']
+        elif predictor_type == 'conv':
+            predictor = ConvPredictor(vocab_size, **configs['predictor_conf'])
+            configs['predictor_conf']['output_size'] = configs[
+                'predictor_conf']['embed_size']
+        else:
+            raise NotImplementedError(
+                "only rnn, embedding and conv type support now")
+        configs['joint_conf']['enc_output_size'] = configs['encoder_conf'][
+            'output_size']
+        configs['joint_conf']['pred_output_size'] = configs['predictor_conf'][
+            'output_size']
+        joint = TransducerJoint(vocab_size, **configs['joint_conf'])
+        model = Transducer(vocab_size=vocab_size,
+                           blank=0,
+                           predictor=predictor,
+                           encoder=encoder,
+                           attention_decoder=decoder,
+                           joint=joint,
+                           ctc=ctc,
+                           context_module=context_module,
+                           **configs['model_conf'])
+    elif 'paraformer' in configs:
+        predictor = Predictor(**configs['cif_predictor_conf'])
+        model = Paraformer(vocab_size=vocab_size,
+                           encoder=encoder,
+                           decoder=decoder,
+                           ctc=ctc,
+                           predictor=predictor,
+                           **configs['model_conf'])
     else:
-        model = WENET_MODEL_CLASSES[model_type](
-            vocab_size=vocab_size,
-            encoder=encoder,
-            decoder=decoder,
-            ctc=ctc,
-            special_tokens=configs.get('tokenizer_conf',
-                                       {}).get('special_tokens', None),
-            **configs['model_conf'])
-
-    # If specify checkpoint, load some info from checkpoint
-    if hasattr(args, 'checkpoint') and args.checkpoint is not None:
-        infos = load_checkpoint(model, args.checkpoint)
-    elif hasattr(args, 'checkpoint') and args.enc_init is not None:
-        infos = load_trained_modules(model, args)
-    else:
-        infos = {}
-    configs["init_infos"] = infos
-    print(configs)
-
-    # Tie emb.weight to decoder.output_layer.weight
-    if model.decoder.tie_word_embedding:
-        model.decoder.tie_or_clone_weights(jit_mode=args.jit)
-
-    return model, configs
+        model = ASRModel(vocab_size=vocab_size,
+                         encoder=encoder,
+                         decoder=decoder,
+                         ctc=ctc,
+                         context_module=context_module,
+                         lfmmi_dir=configs.get('lfmmi_dir', ''),
+                         **configs['model_conf'])
+    return model
