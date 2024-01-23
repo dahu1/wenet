@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Modified from ESPnet(https://github.com/espnet/espnet)
+
 """ConvolutionModule definition."""
 
 from typing import Tuple
@@ -22,7 +23,6 @@ from torch import nn
 
 class ConvolutionModule(nn.Module):
     """ConvolutionModule in Conformer model."""
-
     def __init__(self,
                  channels: int,
                  kernel_size: int = 15,

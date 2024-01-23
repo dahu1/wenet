@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Label smoothing module."""
 
 import torch
@@ -50,7 +51,6 @@ class LabelSmoothingLoss(nn.Module):
             normalize loss by sequence length if True
             normalize loss by batch size if False
     """
-
     def __init__(self,
                  size: int,
                  padding_idx: int,
@@ -79,6 +79,9 @@ class LabelSmoothingLoss(nn.Module):
         Returns:
             loss (torch.Tensor) : The KL loss, scalar float value
         """
+        # print("x size ",x, x.size() ,x.shape)
+        # print("target size ", target, target.size() ,target.shape)
+        # print("self size ",self.size)
         assert x.size(2) == self.size
         batch_size = x.size(0)
         x = x.view(-1, self.size)

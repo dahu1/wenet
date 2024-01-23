@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Swish() activation function for Conformer."""
 
 import torch
@@ -20,7 +21,6 @@ import torch
 
 class Swish(torch.nn.Module):
     """Construct an Swish object."""
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return Swish activation function."""
         return x * torch.sigmoid(x)
