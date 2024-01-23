@@ -25,13 +25,13 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 from textgrid import TextGrid, IntervalTier
-import math
 
 from wenet.dataset.dataset import Dataset
-from wenet.utils.ctc_utils import force_align
+from wenet.utils.checkpoint import load_checkpoint
+from wenet.utils.file_utils import read_symbol_table, read_non_lang_symbols
+from wenet.utils.ctc_util import forced_align
 from wenet.utils.common import get_subsample
 from wenet.utils.init_model import init_model
-from wenet.utils.init_tokenizer import init_tokenizer
 
 
 def generator_textgrid(maxtime, lines, output):
@@ -52,17 +52,13 @@ def generator_textgrid(maxtime, lines, output):
     tg.write(output)
 
 
-def get_frames_timestamp(alignment,
-                         prob,
-                         blank_thres=0.999,
-                         thres=0.0000000001):
+def get_frames_timestamp(alignment):
     # convert alignment to a praat format, which is a doing phonetics
     # by computer and helps analyzing alignment
     timestamp = []
     # get frames level duration for each token
     start = 0
     end = 0
-    local_start = 0
     while end < len(alignment):
         while end < len(alignment) and alignment[end] == 0:
             end += 1
@@ -72,44 +68,26 @@ def get_frames_timestamp(alignment,
         end += 1
         while end < len(alignment) and alignment[end - 1] == alignment[end]:
             end += 1
-        local_start = end - 1
-        # find the possible front border for current token
-        while local_start >= start and (
-                prob[local_start][0] < math.log(blank_thres)
-                or prob[local_start][alignment[end - 1]] > math.log(thres)):
-            alignment[local_start] = alignment[end - 1]
-            local_start -= 1
-        cur_alignment = alignment[start:end]
-        timestamp.append(cur_alignment)
+        timestamp.append(alignment[start:end])
         start = end
     return timestamp
 
 
 def get_labformat(timestamp, subsample):
     begin = 0
-    begin_time = 0
     duration = 0
     labformat = []
     for idx, t in enumerate(timestamp):
         # 25ms frame_length,10ms hop_length, 1/subsample
         subsample = get_subsample(configs)
         # time duration
-        i = 0
-        while t[i] == 0:
-            i += 1
-        begin = i
-        dur = 0
-        while i < len(t) and t[i] != 0:
-            i += 1
-            dur += 1
-        begin = begin_time + begin * 0.01 * subsample
-        duration = dur * 0.01 * subsample
+        duration = len(t) * 0.01 * subsample
         if idx < len(timestamp) - 1:
             print("{:.2f} {:.2f} {}".format(begin, begin + duration,
                                             char_dict[t[-1]]))
             labformat.append("{:.2f} {:.2f} {}\n".format(
                 begin, begin + duration, char_dict[t[-1]]))
-        else:  # last token
+        else:
             non_blank = 0
             for i in t:
                 if i != 0:
@@ -119,7 +97,7 @@ def get_labformat(timestamp, subsample):
                                             char_dict[token]))
             labformat.append("{:.2f} {:.2f} {}\n".format(
                 begin, begin + duration, char_dict[token]))
-        begin_time += len(t) * 0.01 * subsample
+        begin = begin + duration
     return labformat
 
 
@@ -136,19 +114,10 @@ if __name__ == '__main__':
                         type=int,
                         default=-1,
                         help='gpu id for this rank, -1 for cpu')
-    parser.add_argument('--blank_thres',
-                        default=0.999999,
-                        type=float,
-                        help='ctc blank thes')
-    parser.add_argument('--thres',
-                        default=0.000001,
-                        type=float,
-                        help='ctc non blank thes')
     parser.add_argument('--checkpoint', required=True, help='checkpoint model')
     parser.add_argument('--dict', required=True, help='dict file')
-    parser.add_argument(
-        '--non_lang_syms',
-        help="non-linguistic symbol file. One symbol per line.")
+    parser.add_argument('--non_lang_syms',
+                        help="non-linguistic symbol file. One symbol per line.")
     parser.add_argument('--result_file',
                         required=True,
                         help='alignment result file')
@@ -183,6 +152,8 @@ if __name__ == '__main__':
             char_dict[int(arr[1])] = arr[0]
     eos = len(char_dict) - 1
 
+    symbol_table = read_symbol_table(args.dict)
+
     # Init dataset and data loader
     ali_conf = copy.deepcopy(configs['dataset_conf'])
 
@@ -194,25 +165,27 @@ if __name__ == '__main__':
     ali_conf['filter_conf']['min_output_input_ratio'] = 0
     ali_conf['speed_perturb'] = False
     ali_conf['spec_aug'] = False
-    ali_conf['spec_trim'] = False
     ali_conf['shuffle'] = False
     ali_conf['sort'] = False
     ali_conf['fbank_conf']['dither'] = 0.0
     ali_conf['batch_conf']['batch_type'] = "static"
     ali_conf['batch_conf']['batch_size'] = args.batch_size
+    non_lang_syms = read_non_lang_symbols(args.non_lang_syms)
 
-    tokenizer = init_tokenizer(configs)
     ali_dataset = Dataset(args.data_type,
                           args.input_file,
-                          tokenizer,
+                          symbol_table,
                           ali_conf,
+                          args.bpe_model,
+                          non_lang_syms,
                           partition=False)
 
     ali_data_loader = DataLoader(ali_dataset, batch_size=None, num_workers=0)
 
     # Init asr model from configs
-    model, configs = init_model(args, configs)
+    model = init_model(configs)
 
+    load_checkpoint(model, args.checkpoint)
     use_cuda = args.gpu >= 0 and torch.cuda.is_available()
     device = torch.device('cuda' if use_cuda else 'cpu')
     model = model.to(device)
@@ -223,6 +196,7 @@ if __name__ == '__main__':
         for batch_idx, batch in enumerate(ali_data_loader):
             print("#" * 80)
             key, feat, target, feats_length, target_length = batch
+            print(key)
 
             feat = feat.to(device)
             target = target.to(device)
@@ -238,12 +212,13 @@ if __name__ == '__main__':
             # print(ctc_probs.size(1))
             ctc_probs = ctc_probs.squeeze(0)
             target = target.squeeze(0)
-            alignment = force_align(ctc_probs, target)
+            alignment = forced_align(ctc_probs, target)
+            print(alignment)
             fout.write('{} {}\n'.format(key[0], alignment))
 
             if args.gen_praat:
-                timestamp = get_frames_timestamp(alignment, ctc_probs,
-                                                 args.blank_thres, args.thres)
+                timestamp = get_frames_timestamp(alignment)
+                print(timestamp)
                 subsample = get_subsample(configs)
                 labformat = get_labformat(timestamp, subsample)
 

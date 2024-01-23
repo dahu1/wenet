@@ -823,6 +823,7 @@ def export_context(model, logger, context_onnx_path, context_pt_path):
     # # context_list like : [[793, 2026, 416], [2218, 6125]]
     # context_list, context_list_lengths = get_context_list_tensor(context_list)
 
+
     # # encoder out shape construct
     # b = 27
     # # b = 1
